@@ -10,6 +10,10 @@ Unreleased
 
 Added
 -----
+- Add Auth0 bearer-token authentication. ``Resolwe`` accepts a ``token``
+  argument (or the ``RESDK_TOKEN`` environment variable) and sends it as an
+  ``Authorization: Bearer`` header. ``Resolwe.login_with_auth0()`` performs an
+  interactive Auth0 browser sign-in (PKCE) and uses the resulting token
 - Add the ``skip_existing`` argument to the ``download`` methods of ``Data``,
   ``Sample`` and ``Collection`` objects. When set to ``True``, files that are
   already present in the download directory and match the md5 checksum of the

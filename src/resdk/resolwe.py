@@ -31,6 +31,7 @@ from packaging import version
 
 from resdk.uploader import Uploader
 
+from . import auth
 from .constants import CHUNK_SIZE
 from .exceptions import ResolweServerError, ValidationError, handle_http_exception
 from .query import (
@@ -184,6 +185,7 @@ class Resolwe:
         username: Optional[str] = None,
         password: Optional[str] = None,
         url: Optional[str] = None,
+        token: Optional[str] = None,
     ):
         """Initialize attributes."""
         self.logger = logging.getLogger(__name__)
@@ -201,12 +203,16 @@ class Resolwe:
         if password is None:
             password = os.environ.get("RESOLWE_API_PASSWORD", None)
 
+        if token is None:
+            # Fall back to an access token provided in the environment.
+            token = auth.token_from_env()
+
         self.url = url
 
         # Check minimal supported version.
         self.version_check()
 
-        self._login(username=username, password=password)
+        self._login(username=username, password=password, token=token)
 
     def version_check(self):
         """Check that the server is compatible with the client."""
@@ -268,8 +274,11 @@ class Resolwe:
         username: Optional[str] = None,
         password: Optional[str] = None,
         interactive: bool = False,
+        token: Optional[str] = None,
     ):
-        self.auth = ResAuth(username, password, self.url, interactive=interactive)
+        self.auth = ResAuth(
+            username, password, self.url, interactive=interactive, token=token
+        )
         self.session.cookies = requests.utils.cookiejar_from_dict(self.auth.cookies)
         self.api = ResolweAPI(
             urljoin(self.url, "/api/"),
@@ -295,6 +304,25 @@ class Resolwe:
         if username is not None and password is None:
             password = getpass.getpass("Password: ")
         self._login(username=username, password=password, interactive=True)
+
+    def login_with_token(self, token: str):
+        """Authenticate with an Auth0 bearer token.
+
+        :param token: the Auth0 access token to send as a bearer credential.
+        """
+        self._login(token=token)
+
+    def login_with_auth0(self, settings: Optional["auth.Auth0Settings"] = None):
+        """Sign in via Auth0 in the browser and use the resulting bearer token.
+
+        The token is kept in memory only. On a machine without a browser, set
+        the token in the ``RESDK_TOKEN`` environment variable instead and pass
+        it to :class:`Resolwe` or :meth:`login_with_token`.
+
+        :param settings: Auth0 settings; read from the ``RESDK_AUTH0_*``
+            environment variables when omitted.
+        """
+        self._login(token=auth.get_access_token(settings))
 
     def get_query_by_resource(self, resource: type[BaseResource]) -> ResolweQuery:
         """Get ResolweQuery for a given resource.
@@ -650,15 +678,24 @@ class AuthCookie(TypedDict):
 class ResAuth(requests.auth.AuthBase):
     """HTTP Resolwe Authentication for Request object.
 
+    Supports two transports:
+
+    * a Django session (``sessionid``/``csrftoken`` cookies), obtained with a
+      username and password or with the interactive browser login, and
+    * an Auth0 bearer token, sent as the ``Authorization`` header. When a
+      ``token`` is given, no cookies are used.
+
     :param str username: user's email
     :param str password: user's password
     :param str url: Resolwe server address
-    :param str cookies: user's sessionid and csrftoken cookies
+    :param str token: Auth0 access token to send as a bearer credential
 
     """
 
     #: Dictionary of authentication cookes.
     cookies: AuthCookie = {"csrftoken": "", "sessionid": ""}
+    #: Auth0 bearer token, when bearer authentication is used.
+    token: Optional[str] = None
 
     def __init__(
         self,
@@ -666,13 +703,21 @@ class ResAuth(requests.auth.AuthBase):
         password: Optional[str] = None,
         url: str = DEFAULT_URL,
         interactive: bool = False,
+        token: Optional[str] = None,
     ):
         """Authenticate user on Resolwe server."""
         self.logger = logging.getLogger(__name__)
         self.username = username
         self.url = url
+        self.token = token
         self.automatic_login_url = urljoin(self.url, AUTOMATIC_LOGIN_POSTFIX)
         self.interactive_login_url = urljoin(self.url, INTERACTIVE_LOGIN_POSTFIX)
+
+        if token is not None:
+            # Bearer authentication: no cookies are used.
+            self.cookies = {}
+            self.logger.info("Using bearer token authentication.")
+            return
 
         if not interactive and (username is None or password is None):
             # Anonymous authentication
@@ -762,6 +807,12 @@ Alternatively, you may visit the following URL which will autofill the code upon
 
     def __call__(self, request: requests.Request) -> requests.Request:
         """Set request headers."""
+        if self.token is not None:
+            # Bearer authentication: no cookie or CSRF header is needed.
+            request.headers["Authorization"] = f"Bearer {self.token}"
+            request.headers["referer"] = self.url
+            return request
+
         if "csrftoken" in self.cookies:
             request.headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
