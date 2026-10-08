@@ -56,6 +56,14 @@ recognize the interpreter by '>>>'. Now we can connect to the Genialis Server:
 
 .. note::
 
+  You can also authenticate with an Auth0 bearer token instead of a session.
+  Call ``res.login_with_auth0()`` to sign in through Auth0 in the browser, or
+  pass a token you already have as ``resdk.Resolwe(url=..., token=...)``. On a
+  machine without a browser (for example CI), set the token in the
+  ``RESDK_TOKEN`` environment variable and it is used automatically.
+
+.. note::
+
 	When connecting to the server through an interactive session, we suggest you
 	use the ``resdk.start_logging()`` command. This allows you to see important
 	messages (*e.g.* warnings and errors) when executing commands.

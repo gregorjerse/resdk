@@ -559,8 +559,14 @@ class BaseTables(abc.ABC):
             source_urls = self._get_data_urls(uri_to_id.keys())
             urls_ids = [(url, uri_to_id[uri]) for uri, url in source_urls.items()]
 
+            # Authenticate like ResAuth does: bearer token as a header, or a
+            # Django session as cookies.
+            res_auth = self.resolwe.auth
+            headers = {}
+            if res_auth.token:
+                headers["Authorization"] = f"Bearer {res_auth.token}"
             async with aiohttp.ClientSession(
-                cookies=self.resolwe.auth.cookies
+                cookies=res_auth.cookies, headers=headers
             ) as session:
                 futures = [
                     self._download_file(url, session, id_, data_type)

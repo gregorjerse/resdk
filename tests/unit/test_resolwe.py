@@ -853,13 +853,19 @@ class TestResAuth(unittest.TestCase):
 
     def test_call(self):
         res_auth = MagicMock(
-            spec=ResAuth, sessionid=None, csrftoken=None, url="www.abc.com"
+            spec=ResAuth,
+            sessionid=None,
+            csrftoken=None,
+            token=None,
+            cookies={},
+            url="www.abc.com",
         )
         resp = ResAuth.__call__(res_auth, MagicMock(headers={}))
         self.assertDictEqual(resp.headers, {"referer": "www.abc.com"})
 
         res_auth = MagicMock(
             spec=ResAuth,
+            token=None,
             cookies={"csrftoken": "my-token", "sessionid": "my-id"},
             url="abc.com",
         )
@@ -867,6 +873,14 @@ class TestResAuth(unittest.TestCase):
         self.assertDictEqual(
             resp.headers,
             {"X-CSRFToken": "my-token", "referer": "abc.com"},
+        )
+
+    def test_call_with_token(self):
+        res_auth = MagicMock(spec=ResAuth, token="a.b.c", url="abc.com")
+        resp = ResAuth.__call__(res_auth, MagicMock(headers={}))
+        self.assertDictEqual(
+            resp.headers,
+            {"Authorization": "Bearer a.b.c", "referer": "abc.com"},
         )
 
 
