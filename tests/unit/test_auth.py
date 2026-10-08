@@ -70,7 +70,7 @@ class TestGetAccessToken(unittest.TestCase):
     def test_interactive_login_used_without_env_token(self):
         settings = auth.Auth0Settings(client_id="cid")
         with patch.dict("os.environ", {}, clear=True):
-            with patch.object(auth, "_login", return_value=("signed-token", 3600)) as m:
+            with patch.object(auth, "_login", return_value="signed-token") as m:
                 self.assertEqual(auth.get_access_token(settings), "signed-token")
                 m.assert_called_once_with(settings)
 

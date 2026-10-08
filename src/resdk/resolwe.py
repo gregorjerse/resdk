@@ -111,12 +111,20 @@ class ResolweAPI(slumber.API):
 class Resolwe:
     """Connect to a Resolwe server.
 
+    Credentials can be passed here, read from the environment
+    (``RESOLWE_API_USERNAME`` and ``RESOLWE_API_PASSWORD``, or ``RESDK_TOKEN``)
+    or supplied later with :meth:`login`, :meth:`login_with_token` or
+    :meth:`login_with_auth0`. Without credentials the connection is anonymous.
+    A token takes precedence over a username and password.
+
     :param username: user's email
     :type username: str
     :param password: user's password
     :type password: str
     :param url: Resolwe server instance
     :type url: str
+    :param token: Auth0 access token, sent as ``Authorization: Bearer``
+    :type token: str
 
     """
 
@@ -306,18 +314,17 @@ class Resolwe:
         self._login(username=username, password=password, interactive=True)
 
     def login_with_token(self, token: str):
-        """Authenticate with an Auth0 bearer token.
+        """Authenticate with a bearer token (an Auth0 access token).
 
-        :param token: the Auth0 access token to send as a bearer credential.
+        :param token: the access token to send as ``Authorization: Bearer``.
         """
         self._login(token=token)
 
-    def login_with_auth0(self, settings: Optional["auth.Auth0Settings"] = None):
-        """Sign in via Auth0 in the browser and use the resulting bearer token.
+    def login_with_auth0(self, settings: Optional[auth.Auth0Settings] = None):
+        """Sign in through Auth0 in the browser and use the resulting token.
 
-        The token is kept in memory only. On a machine without a browser, set
-        the token in the ``RESDK_TOKEN`` environment variable instead and pass
-        it to :class:`Resolwe` or :meth:`login_with_token`.
+        If ``RESDK_TOKEN`` is set, that token is used and no browser is opened
+        (for machines without a browser). The token is kept in memory only.
 
         :param settings: Auth0 settings; read from the ``RESDK_AUTH0_*``
             environment variables when omitted.
@@ -678,12 +685,13 @@ class AuthCookie(TypedDict):
 class ResAuth(requests.auth.AuthBase):
     """HTTP Resolwe Authentication for Request object.
 
-    Supports two transports:
+    Authenticates with either
 
     * a Django session (``sessionid``/``csrftoken`` cookies), obtained with a
-      username and password or with the interactive browser login, and
+      username and password or with the interactive browser login, or
     * an Auth0 bearer token, sent as the ``Authorization`` header. When a
-      ``token`` is given, no cookies are used.
+      ``token`` is given, username and password are ignored and no cookies
+      are used.
 
     :param str username: user's email
     :param str password: user's password
@@ -810,10 +818,7 @@ Alternatively, you may visit the following URL which will autofill the code upon
         if self.token is not None:
             # Bearer authentication: no cookie or CSRF header is needed.
             request.headers["Authorization"] = f"Bearer {self.token}"
-            request.headers["referer"] = self.url
-            return request
-
-        if "csrftoken" in self.cookies:
+        elif "csrftoken" in self.cookies:
             request.headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
         request.headers["referer"] = self.url
