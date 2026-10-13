@@ -21,10 +21,6 @@ computer. Run this command in the terminal (CMD on Windows)::
 .. _Python: https://www.python.org/downloads/
 .. _pip: https://pip.pypa.io/en/stable/installing/
 
-.. note::
-
-  If you are using Apple silicon you should use Python version 3.10 or higher.
-
 Registration
 ============
 

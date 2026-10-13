@@ -29,6 +29,7 @@ Fixed
 
 Changed
 -------
+- Drop support for ``Python 3.9`` and ``Python 3.10``
 - Change the parsing logic for the one-to-one metadata table
   in ``BaseTables`` class so it does not fail when the table
   index does not reflect the state of samples in the collection
