@@ -3,6 +3,7 @@ Unit tests for resdk/resolwe.py file.
 """
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -14,10 +15,16 @@ from mock import MagicMock, patch
 from slumber.exceptions import SlumberHttpBaseException
 
 from resdk.exceptions import ResolweServerError, ValidationError
-from resdk.resolwe import ResAuth, Resolwe, ResolweResource
+from resdk.resolwe import (
+    ResAuth,
+    Resolwe,
+    ResolweResource,
+    _CredentialSafeSession,
+)
 from resdk.resources import Collection, Data, Process
 from resdk.resources.fields import DataSource
 from resdk.uploader import Uploader
+from resdk.utils import url_origin
 
 from .utils import server_resource
 
@@ -129,9 +136,11 @@ class TestResolwe(unittest.TestCase):
         rep = Resolwe.__repr__(resolwe_mock)
         self.assertEqual(rep, "Resolwe <url: www.abc.com>")
 
+    @patch("resdk.resolwe.auth.sign_in", side_effect=RuntimeError("no Auth0"))
     @patch("resdk.resolwe.requests")
     @patch("resdk.resolwe.ResAuth")
-    def test_env_variables(self, resauth_mock, requests_mock):
+    @patch("resdk.resolwe._CredentialSafeSession")
+    def test_env_variables(self, session_mock, resauth_mock, requests_mock, sign_in):
         # Ensure environmental variables are not set.
         os.environ.pop("RESOLWE_HOST_URL", None)
         os.environ.pop("RESOLWE_API_USERNAME", None)
@@ -151,6 +160,29 @@ class TestResolwe(unittest.TestCase):
         self.assertEqual(resolwe_api.url, "http://resolwe-api:8000")
         self.assertEqual(resauth_mock.call_args[0][0], "foo")
         self.assertEqual(resauth_mock.call_args[0][1], "bar")
+
+    @patch.dict(os.environ, {"RESDK_TOKEN": "env-token"}, clear=True)
+    @patch("resdk.resolwe.auth.sign_in", side_effect=RuntimeError("no Auth0"))
+    @patch("resdk.resolwe.requests")
+    @patch("resdk.resolwe.ResAuth")
+    @patch("resdk.resolwe._CredentialSafeSession")
+    def test_env_token_precedence(
+        self, session_mock, resauth_mock, requests_mock, sign_in
+    ):
+        # The environment token is used when there are no credentials, or only
+        # a username.
+        Resolwe()
+        self.assertEqual(resauth_mock.call_args.kwargs["token"], "env-token")
+        Resolwe(username="foo")
+        self.assertEqual(resauth_mock.call_args.kwargs["token"], "env-token")
+
+        # A username and password pair wins over the environment token.
+        Resolwe(username="foo", password="bar")
+        self.assertIsNone(resauth_mock.call_args.kwargs["token"])
+
+        # An explicit token wins over everything.
+        Resolwe(username="foo", password="bar", token="arg-token")
+        self.assertEqual(resauth_mock.call_args.kwargs["token"], "arg-token")
 
 
 class TestProcessFileField(unittest.TestCase):
@@ -772,6 +804,158 @@ class TestDownload(unittest.TestCase):
         resolwe_mock.session.get.assert_not_called()
 
 
+class TestCredentialSafeSession(unittest.TestCase):
+    def _prepare(self, url, headers):
+        request = requests.models.PreparedRequest()
+        request.prepare(method="GET", url=url, headers=headers)
+        return request
+
+    def _response(self, url):
+        response = requests.models.Response()
+        response.request = self._prepare(url, {})
+        return response
+
+    def test_strips_credentials_on_cross_host_redirect(self):
+        session = _CredentialSafeSession()
+        session.credential_origin = ("https", "genialis.example", 443)
+        redirected = self._prepare(
+            "https://storage.example/signed",
+            {
+                "Cookie": "sessionid=secret",
+                "X-CSRFToken": "csrf",
+                "Authorization": "Bearer token",
+            },
+        )
+        session.rebuild_auth(
+            redirected, self._response("https://genialis.example/data")
+        )
+        self.assertNotIn("Cookie", redirected.headers)
+        self.assertNotIn("X-CSRFToken", redirected.headers)
+        self.assertNotIn("Authorization", redirected.headers)
+
+    def test_keeps_credentials_on_same_host_redirect(self):
+        session = _CredentialSafeSession()
+        session.credential_origin = ("https", "genialis.example", 443)
+        redirected = self._prepare(
+            "https://genialis.example/other",
+            {"Cookie": "sessionid=secret", "X-CSRFToken": "csrf"},
+        )
+        session.rebuild_auth(
+            redirected, self._response("https://genialis.example/data")
+        )
+        self.assertEqual(redirected.headers["Cookie"], "sessionid=secret")
+        self.assertEqual(redirected.headers["X-CSRFToken"], "csrf")
+
+    def test_strips_credentials_on_same_host_port_change_or_downgrade(self):
+        session = _CredentialSafeSession()
+        session.credential_origin = ("https", "genialis.example", 443)
+        for target in (
+            "https://genialis.example:8443/other",
+            "http://genialis.example/other",
+        ):
+            redirected = self._prepare(
+                target, {"Cookie": "sessionid=secret", "X-CSRFToken": "csrf"}
+            )
+            session.rebuild_auth(
+                redirected, self._response("https://genialis.example/data")
+            )
+            self.assertNotIn("Cookie", redirected.headers)
+            self.assertNotIn("X-CSRFToken", redirected.headers)
+
+    def _follow(self, chain):
+        """Request chain[0] with credentials; each URL redirects to the next."""
+        redirects = dict(zip(chain, chain[1:]))
+        sent = []
+
+        class FakeAdapter(requests.adapters.BaseAdapter):
+            def send(self, request, **kwargs):
+                sent.append(request)
+                response = requests.models.Response()
+                response.request = request
+                response.url = request.url
+                response.raw = io.BytesIO(b"")
+                if request.url in redirects:
+                    response.status_code = 302
+                    response.headers["Location"] = redirects[request.url]
+                else:
+                    response.status_code = 200
+                return response
+
+            def close(self):
+                pass
+
+        session = _CredentialSafeSession()
+        session.credential_origin = url_origin(chain[0])
+        session.mount("http://", FakeAdapter())
+        session.mount("https://", FakeAdapter())
+        session.cookies.set("sessionid", "secret")
+        session.get(chain[0], headers={"X-CSRFToken": "csrf"})
+        self.assertEqual([request.url for request in sent], chain)
+        self.assertIn("sessionid=secret", sent[0].headers["Cookie"])
+        return sent
+
+    def test_strips_credentials_when_resolwe_origin_is_unset(self):
+        session = _CredentialSafeSession()
+        redirected = self._prepare(
+            "https://genialis.example/other",
+            {"Cookie": "sessionid=secret", "X-CSRFToken": "csrf"},
+        )
+        session.rebuild_auth(
+            redirected, self._response("https://genialis.example/data")
+        )
+        self.assertNotIn("Cookie", redirected.headers)
+        self.assertNotIn("X-CSRFToken", redirected.headers)
+
+    def test_strips_credentials_on_every_hop_of_a_redirect_chain(self):
+        """Cookies are re-added on each hop, so every later hop must strip them."""
+        chains = [
+            [
+                "https://genialis.example/data",
+                "https://storage.example/signed",
+                "https://storage.example/final",
+            ],
+            [
+                "https://genialis.example/data",
+                "https://genialis.example:8443/signed",
+                "https://genialis.example:8443/final",
+            ],
+            [
+                "https://genialis.example/data",
+                "http://genialis.example/signed",
+                "http://genialis.example/final",
+            ],
+        ]
+        for chain in chains:
+            with self.subTest(chain=chain):
+                for request in self._follow(chain)[1:]:
+                    self.assertNotIn("Cookie", request.headers)
+                    self.assertNotIn("X-CSRFToken", request.headers)
+
+    def test_keeps_credentials_on_https_upgrade(self):
+        sent = self._follow(
+            ["http://genialis.example/data", "https://genialis.example/data"]
+        )
+        self.assertIn("sessionid=secret", sent[1].headers["Cookie"])
+        self.assertEqual(sent[1].headers["X-CSRFToken"], "csrf")
+
+
+class TestUrlOrigin(unittest.TestCase):
+    def test_fills_default_ports_and_lowercases_the_host(self):
+        self.assertEqual(
+            url_origin("https://Genialis.example/a"), ("https", "genialis.example", 443)
+        )
+        self.assertEqual(
+            url_origin("http://genialis.example:8000"),
+            ("http", "genialis.example", 8000),
+        )
+
+    def test_matches_the_idna_host_requests_sends(self):
+        prepared = requests.Request("GET", "https://bücher.example/x").prepare()
+        self.assertEqual(
+            url_origin("https://bücher.example/"), url_origin(prepared.url)
+        )
+
+
 class TestResAuth(unittest.TestCase):
     @patch("resdk.resolwe.ResAuth", spec=True)
     def setUp(self, auth_mock):
@@ -853,13 +1037,19 @@ class TestResAuth(unittest.TestCase):
 
     def test_call(self):
         res_auth = MagicMock(
-            spec=ResAuth, sessionid=None, csrftoken=None, url="www.abc.com"
+            spec=ResAuth,
+            sessionid=None,
+            csrftoken=None,
+            token=None,
+            cookies={},
+            url="www.abc.com",
         )
         resp = ResAuth.__call__(res_auth, MagicMock(headers={}))
         self.assertDictEqual(resp.headers, {"referer": "www.abc.com"})
 
         res_auth = MagicMock(
             spec=ResAuth,
+            token=None,
             cookies={"csrftoken": "my-token", "sessionid": "my-id"},
             url="abc.com",
         )
@@ -867,6 +1057,14 @@ class TestResAuth(unittest.TestCase):
         self.assertDictEqual(
             resp.headers,
             {"X-CSRFToken": "my-token", "referer": "abc.com"},
+        )
+
+    def test_call_with_token(self):
+        res_auth = MagicMock(spec=ResAuth, token="a.b.c", url="abc.com")
+        resp = ResAuth.__call__(res_auth, MagicMock(headers={}))
+        self.assertDictEqual(
+            resp.headers,
+            {"Authorization": "Bearer a.b.c", "referer": "abc.com"},
         )
 
 
