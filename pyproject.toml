@@ -84,7 +84,6 @@ documentation = "https://docs.genialis.com/resdk/"
 [tool.setuptools_scm]
 
 [tool.ruff]
-target-version = "py39"
 src = ["src"]
 
 [tool.ruff.lint]
