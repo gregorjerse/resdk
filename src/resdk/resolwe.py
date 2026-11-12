@@ -15,22 +15,25 @@ import logging
 import ntpath
 import os
 import re
+import sys
 import time
 import webbrowser
 from collections import defaultdict
 from contextlib import suppress
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Iterable, Optional, TypedDict, Union
+from typing import Dict, Iterable, Optional, TypedDict, Union
 from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 import slumber
 import tqdm
 from packaging import version
+from requests.exceptions import RequestException
 
 from resdk.uploader import Uploader
 
+from . import auth
 from .constants import CHUNK_SIZE
 from .exceptions import ResolweServerError, ValidationError, handle_http_exception
 from .query import (
@@ -66,7 +69,7 @@ from .resources.base import BaseResource
 from .resources.fields import DataSource
 from .resources.kb import Feature, Mapping
 from .resources.utils import get_collection_id, get_data_id, is_data, iterate_fields
-from .utils import md5
+from .utils import is_credential_origin, md5, url_origin
 
 DEFAULT_URL = "http://localhost:8000"
 AUTOMATIC_LOGIN_POSTFIX = "saml-auth/api-login/"
@@ -107,8 +110,40 @@ class ResolweAPI(slumber.API):
     resource_class = ResolweResource
 
 
+class _CredentialSafeSession(requests.Session):
+    """A session that sends credentials on redirect only to the Resolwe origin.
+
+    ``requests`` drops the ``Authorization`` header when a redirect crosses to a
+    different host, but it re-sends cookies and leaves custom headers in place.
+    Downloads redirect to pre-signed storage URLs on a different host, so also
+    drop the session cookies and the ``X-CSRFToken`` header there.
+
+    Every redirect hop is compared with the Resolwe origin (scheme, host and
+    port), not with the previous hop: ``requests`` adds the cookies again on
+    each hop, so a second redirect within the storage host would otherwise get
+    them back. Only an http-to-https upgrade of the Resolwe origin keeps them.
+    """
+
+    #: Origin of the Resolwe server, set by :class:`Resolwe`.
+    credential_origin = None
+
+    def rebuild_auth(self, prepared_request, response):
+        """Strip cookies and the CSRF header on a redirect away from Resolwe."""
+        super().rebuild_auth(prepared_request, response)
+        if not is_credential_origin(prepared_request.url, self.credential_origin):
+            prepared_request.headers.pop("Cookie", None)
+            prepared_request.headers.pop("X-CSRFToken", None)
+
+
 class Resolwe:
     """Connect to a Resolwe server.
+
+    Credentials can be passed here, read from the environment
+    (``RESOLWE_API_USERNAME`` and ``RESOLWE_API_PASSWORD``, or ``RESDK_TOKEN``)
+    or supplied later with :meth:`login`, :meth:`login_with_token` or
+    :meth:`login_with_auth0`. Without credentials the connection is anonymous.
+    A ``token`` argument takes precedence over a username and password.
+    ``RESDK_TOKEN`` is used unless both a username and a password are given.
 
     :param username: user's email
     :type username: str
@@ -116,6 +151,8 @@ class Resolwe:
     :type password: str
     :param url: Resolwe server instance
     :type url: str
+    :param token: Auth0 access token, sent as ``Authorization: Bearer``
+    :type token: str
 
     """
 
@@ -184,16 +221,18 @@ class Resolwe:
         username: Optional[str] = None,
         password: Optional[str] = None,
         url: Optional[str] = None,
+        token: Optional[str] = None,
     ):
         """Initialize attributes."""
         self.logger = logging.getLogger(__name__)
-        self.session = requests.Session()
+        self.session = _CredentialSafeSession()
         self.uploader = Uploader(self)
         if url is None:
             # Try to get URL from environmental variable, otherwise fallback to default.
             url = os.environ.get("RESOLWE_HOST_URL", DEFAULT_URL)
 
         self._validate_url(url)
+        self.session.credential_origin = url_origin(url)
 
         if username is None:
             username = os.environ.get("RESOLWE_API_USERNAME", None)
@@ -201,12 +240,20 @@ class Resolwe:
         if password is None:
             password = os.environ.get("RESOLWE_API_PASSWORD", None)
 
+        if token is None and not (username and password):
+            # Use the token from the environment unless a full username and
+            # password pair was given.
+            token = auth.token_from_env()
+
         self.url = url
 
         # Check minimal supported version.
         self.version_check()
 
-        self._login(username=username, password=password)
+        if token is None and username and password:
+            self._login_with_password(username, password)
+        else:
+            self._login(username=username, password=password, token=token)
 
     def version_check(self):
         """Check that the server is compatible with the client."""
@@ -268,8 +315,11 @@ class Resolwe:
         username: Optional[str] = None,
         password: Optional[str] = None,
         interactive: bool = False,
+        token: Optional[Union[str, auth.Auth0Session]] = None,
     ):
-        self.auth = ResAuth(username, password, self.url, interactive=interactive)
+        self.auth = ResAuth(
+            username, password, self.url, interactive=interactive, token=token
+        )
         self.session.cookies = requests.utils.cookiejar_from_dict(self.auth.cookies)
         self.api = ResolweAPI(
             urljoin(self.url, "/api/"),
@@ -294,7 +344,83 @@ class Resolwe:
         """
         if username is not None and password is None:
             password = getpass.getpass("Password: ")
-        self._login(username=username, password=password, interactive=True)
+        if username and password:
+            self._login_with_password(username, password)
+        else:
+            self._login(username=username, password=password, interactive=True)
+
+    def _login_with_password(self, username: str, password: str):
+        """Sign in with a username and password, through Auth0 if possible.
+
+        The password goes to Auth0 only when this server is the one the
+        selected tenant serves (``RESDK_AUTH0_TENANT``): app.genialis.com for
+        ``production``, qa.genialis.io for ``test``. Auth0 then checks it and
+        issues tokens, which are renewed in memory. Any other server, such as a
+        local or customer one, gets the password directly, so failed attempts
+        never count against Auth0's brute-force protection.
+
+        If Auth0 refuses, or the server does not accept its token (because
+        bearer authentication is not enabled there yet), the old password login
+        of the Resolwe server is used instead.
+        """
+        try:
+            settings = auth.Auth0Settings.from_env()
+        except ValueError as error:
+            self.logger.info("Not signing in through Auth0: %s", error)
+            settings = None
+        if settings is not None and settings.serves(self.url):
+            try:
+                session = auth.sign_in(settings, username=username, password=password)
+            except (RuntimeError, RequestException) as error:
+                self.logger.warning(
+                    "Auth0 sign-in failed (%s); using the server login.", error
+                )
+            else:
+                self._login(token=session)
+                if self.auth.username is not None:
+                    return
+                self.logger.warning(
+                    "The server did not accept the Auth0 token; using the server login."
+                )
+        self._login(username=username, password=password)
+
+    def login_with_token(self, token: str):
+        """Authenticate with a bearer token (an Auth0 access token).
+
+        :param token: the access token to send as ``Authorization: Bearer``.
+        """
+        self._login(token=token)
+
+    def login_with_auth0(
+        self,
+        settings: Optional[auth.Auth0Settings] = None,
+        device: Optional[bool] = None,
+    ):
+        """Sign in through Auth0 and use the resulting token.
+
+        If ``RESDK_TOKEN`` is set, that token is used and nobody signs in.
+        Otherwise the browser on this machine is used, or, without one, the
+        Device Authorization Flow, which prints an address and a code to
+        approve on any device. The tokens are kept in memory only and the
+        access token is renewed before it expires.
+
+        :param settings: Auth0 settings; read from ``RESDK_AUTH0_TENANT`` when
+            omitted.
+        :param device: ``True`` for the device flow, ``False`` for the browser;
+            chosen automatically by default.
+        """
+        self._login(token=auth.sign_in(settings, device=device))
+        # Another user on the same machine can see the sign-in URL and complete
+        # it with their own account, so show which account was signed in.
+        if self.auth.username:
+            message = f"Signed in to Resolwe as {self.auth.username}."
+        else:
+            # The lookup fails when the server rejects the token.
+            message = (
+                "Got an Auth0 token, but Resolwe did not identify the account: "
+                "the token may not be valid for this server."
+            )
+        print(message, file=sys.stderr)
 
     def get_query_by_resource(self, resource: type[BaseResource]) -> ResolweQuery:
         """Get ResolweQuery for a given resource.
@@ -650,15 +776,26 @@ class AuthCookie(TypedDict):
 class ResAuth(requests.auth.AuthBase):
     """HTTP Resolwe Authentication for Request object.
 
+    Authenticates with either
+
+    * a Django session (``sessionid``/``csrftoken`` cookies), obtained with a
+      username and password or with the interactive browser login, or
+    * an Auth0 bearer token, sent as the ``Authorization`` header. When a
+      ``token`` is given, username and password are ignored and no cookies
+      are used.
+
     :param str username: user's email
     :param str password: user's password
     :param str url: Resolwe server address
-    :param str cookies: user's sessionid and csrftoken cookies
+    :param token: Auth0 access token to send as a bearer credential, or an
+        :class:`~resdk.auth.Auth0Session` that renews it
 
     """
 
-    #: Dictionary of authentication cookes.
-    cookies: AuthCookie = {"csrftoken": "", "sessionid": ""}
+    #: Authentication cookies. Empty in bearer-token mode.
+    cookies: Dict[str, str] = {"csrftoken": "", "sessionid": ""}
+    #: Auth0 session, when bearer authentication is used.
+    tokens: Optional[auth.Auth0Session] = None
 
     def __init__(
         self,
@@ -666,13 +803,33 @@ class ResAuth(requests.auth.AuthBase):
         password: Optional[str] = None,
         url: str = DEFAULT_URL,
         interactive: bool = False,
+        token: Optional[Union[str, auth.Auth0Session]] = None,
     ):
-        """Authenticate user on Resolwe server."""
+        """Authenticate user on Resolwe server.
+
+        :raises ValueError: if ``token`` is empty or contains whitespace or
+            control characters.
+        """
+        if isinstance(token, str):
+            # A malformed token would fail every request with an unclear error.
+            token = token.strip()
+            if not token:
+                raise ValueError("The token is empty.")
+            if any(char.isspace() or not char.isprintable() for char in token):
+                raise ValueError("The token contains whitespace or control characters.")
+            token = auth.Auth0Session(token)
         self.logger = logging.getLogger(__name__)
         self.username = username
         self.url = url
+        self.tokens = token
         self.automatic_login_url = urljoin(self.url, AUTOMATIC_LOGIN_POSTFIX)
         self.interactive_login_url = urljoin(self.url, INTERACTIVE_LOGIN_POSTFIX)
+
+        if self.tokens is not None:
+            # Bearer authentication: no cookies are used.
+            self.cookies = {}
+            self.logger.info("Using bearer token authentication.")
+            return
 
         if not interactive and (username is None or password is None):
             # Anonymous authentication
@@ -760,9 +917,20 @@ Alternatively, you may visit the following URL which will autofill the code upon
 
         return cookie_dict
 
+    @property
+    def token(self) -> Optional[str]:
+        """Return the current access token, renewed if it is about to expire."""
+        return self.tokens.access_token if self.tokens is not None else None
+
     def __call__(self, request: requests.Request) -> requests.Request:
         """Set request headers."""
-        if "csrftoken" in self.cookies:
+        token = self.token
+        if token is not None:
+            # Bearer authentication: no cookie or CSRF header is needed.
+            request.headers["Authorization"] = f"Bearer {token}"
+            if self.tokens is not None and self.tokens.can_refresh:
+                request.register_hook("response", self._retry_after_rejection)
+        elif "csrftoken" in self.cookies:
             request.headers["X-CSRFToken"] = self.cookies["csrftoken"]
 
         request.headers["referer"] = self.url
@@ -771,3 +939,42 @@ Alternatively, you may visit the following URL which will autofill the code upon
         # if r.path_url != '/upload/':
         #     r.headers['X-SubscribeID'] = self.subscribe_id
         return request
+
+    def _retry_after_rejection(
+        self, response: requests.Response, **kwargs
+    ) -> requests.Response:
+        """Renew the token and resend a request the server rejected with 401.
+
+        The token can be revoked or expire early. This retries once; a second
+        401 is returned to the caller.
+        """
+        if response.status_code != 401 or getattr(
+            response.request, "_resdk_retried", False
+        ):
+            return response
+        assert self.tokens is not None
+        sent = response.request.headers.get("Authorization", "")
+        # Retry only a request that carried our token to the Resolwe server.
+        # After a redirect to another origin (such as a storage host) the token
+        # was not sent, and it must not be sent there on a retry either.
+        if not sent.startswith("Bearer ") or not is_credential_origin(
+            response.request.url, url_origin(self.url)
+        ):
+            return response
+        try:
+            renewed = self.tokens.refresh_after_rejection(sent[len("Bearer ") :])
+        except (RuntimeError, RequestException) as error:
+            self.logger.warning("Could not renew the access token: %s", error)
+            renewed = False
+        if not renewed:
+            return response
+        # Release the connection of the rejected response before resending.
+        response.content
+        response.close()
+        retry = response.request.copy()
+        retry._resdk_retried = True  # type: ignore[attr-defined]
+        retry.headers["Authorization"] = f"Bearer {self.tokens.access_token}"
+        new_response = response.connection.send(retry, **kwargs)
+        new_response.history.append(response)
+        new_response.request = retry
+        return new_response

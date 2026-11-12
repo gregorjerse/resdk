@@ -3,14 +3,23 @@ from datetime import datetime
 from io import StringIO
 from time import sleep, time
 
+import aiohttp
+import numpy as np
 import pandas as pd
 import pytz
-from mock import MagicMock, NonCallableMagicMock, patch
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+from mock import MagicMock, NonCallableMagicMock, PropertyMock, patch
 from pandas.testing import assert_frame_equal
 
 from resdk.resources import AnnotationField, AnnotationValue, Sample
 from resdk.tables import RNATables
-from resdk.tables.qc import _mate_file_groups, general_multiqc_parser
+from resdk.tables.base import BaseTables
+from resdk.tables.qc import (
+    _mate_file_groups,
+    general_multiqc_parser,
+    macs_prepeak_parser,
+)
 
 from .utils import server_resource
 
@@ -340,7 +349,32 @@ class TestTables(unittest.TestCase):
         ct = RNATables(self.collection)
         relations = ct._get_relations()
 
-        expected = pd.DataFrame(["L1"], columns=["Category"], index=[123])
+        expected = pd.DataFrame(["L1"], columns=["Category"], index=[123], dtype=object)
+        expected.index.name = "sample_id"
+
+        assert_frame_equal(relations, expected)
+
+    def test_get_relations_partial_coverage(self):
+        other = NonCallableMagicMock(spec=Sample)
+        other.id = 456
+        self.relation.partitions = [
+            {"id": 1, "entity": 123, "position": 10, "label": "L1"},
+            {"id": 2, "entity": 999, "position": None, "label": "Outside"},
+        ]
+        ct = RNATables(self.collection)
+        with patch.object(
+            RNATables,
+            "_samples",
+            new_callable=PropertyMock,
+            return_value=[self.sample, other],
+        ):
+            relations = ct._get_relations()
+
+        # A sample without a partition is missing; a partition of a sample that
+        # is not in the table is dropped.
+        expected = pd.DataFrame(
+            ["L1 / 10", np.nan], columns=["Category"], index=[123, 456], dtype=object
+        )
         expected.index.name = "sample_id"
 
         assert_frame_equal(relations, expected)
@@ -459,6 +493,142 @@ class TestTables(unittest.TestCase):
         self.assertDictEqual(mapping, self.gene_map)
 
 
+class TestRequestAuth(unittest.TestCase):
+    def setUp(self):
+        self.tables = MagicMock()
+        self.tables.resolwe.url = "https://Genialis.example:443"
+        self.tables.resolwe.auth = MagicMock(token="token", cookies={"a": "b"})
+
+    def test_credentials_for_resolwe_host(self):
+        headers, cookies = BaseTables._request_auth(
+            self.tables, "https://genialis.example/data/1/file"
+        )
+        self.assertEqual(headers, {"Authorization": "Bearer token"})
+        self.assertEqual(cookies, {"a": "b"})
+
+    def test_no_credentials_for_other_origins(self):
+        for url in (
+            "https://storage.example/signed",
+            "http://genialis.example/data/1/file",
+            "https://genialis.example:8443/data/1/file",
+        ):
+            self.assertEqual(BaseTables._request_auth(self.tables, url), ({}, {}))
+
+    def test_credentials_for_https_upgrade(self):
+        self.tables.resolwe.url = "http://genialis.example"
+        headers, _ = BaseTables._request_auth(self.tables, "https://genialis.example/f")
+        self.assertEqual(headers, {"Authorization": "Bearer token"})
+
+
+class TestTokenRenewalBeforeDownload(unittest.TestCase):
+    @patch("resdk.tables.base.save_pickle")
+    @patch("resdk.tables.base.load_pickle", return_value=None)
+    def test_token_is_renewed_before_the_event_loop_starts(self, load, save):
+        calls = []
+
+        class Auth:
+            @property
+            def token(self):
+                calls.append("token")
+                return "a1"
+
+        tables = MagicMock(META="meta")
+        tables.resolwe.auth = Auth()
+        with patch(
+            "resdk.tables.base.asyncio.run",
+            side_effect=lambda coro: calls.append("run"),
+        ) as run:
+            BaseTables._load_fetch(tables, "exp")
+        self.assertEqual(calls, ["token", "run"])
+        run.call_args.args[0].close()
+
+
+class TestFetch(unittest.IsolatedAsyncioTestCase):
+    async def test_credentials_only_on_resolwe_hops(self):
+        """A redirect chain to storage gets no credentials on any storage hop."""
+        seen = []
+
+        def handler(target):
+            async def handle(request):
+                seen.append(
+                    (
+                        request.host,
+                        request.path,
+                        request.headers.get("Cookie"),
+                        request.headers.get("Authorization"),
+                    )
+                )
+                if target:
+                    # A cookie set on the way must not reach the next host.
+                    raise web.HTTPFound(
+                        target(request), headers={"Set-Cookie": "csrftoken=new"}
+                    )
+                return web.Response(body=b"content")
+
+            return handle
+
+        storage_app = web.Application()
+        storage_app.router.add_get("/signed", handler(lambda r: "/final"))
+        storage_app.router.add_get("/final", handler(None))
+        # localhost, not 127.0.0.1: aiohttp stores no cookies for IP hosts.
+        storage = TestServer(storage_app, host="localhost")
+        await storage.start_server()
+        self.addAsyncCleanup(storage.close)
+
+        resolwe_app = web.Application()
+        resolwe_app.router.add_get(
+            "/data/1/file", handler(lambda r: str(storage.make_url("/signed")))
+        )
+        resolwe = TestServer(resolwe_app, host="localhost")
+        await resolwe.start_server()
+        self.addAsyncCleanup(resolwe.close)
+
+        tables = MagicMock()
+        tables.resolwe.url = str(resolwe.make_url("/"))
+        tables.resolwe.auth = MagicMock(token="token", cookies={"sessionid": "s"})
+        tables._request_auth = lambda url: BaseTables._request_auth(tables, url)
+
+        async with BaseTables._download_session() as session:
+            content = await BaseTables._fetch(
+                tables, session, str(resolwe.make_url("/data/1/file"))
+            )
+
+        self.assertEqual(content, b"content")
+        self.assertEqual(
+            [path for _, path, _, _ in seen], ["/data/1/file", "/signed", "/final"]
+        )
+        self.assertEqual(seen[0][2:], ("sessionid=s", "Bearer token"))
+        for _, _, cookie, authorization in seen[1:]:
+            self.assertIsNone(cookie)
+            self.assertIsNone(authorization)
+
+    async def test_error_does_not_show_credentials(self):
+        """A failed download raises an error without the request headers."""
+        app = web.Application()
+        app.router.add_get("/data/1/file", lambda request: web.Response(status=401))
+        server = TestServer(app, host="localhost")
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+
+        tables = MagicMock()
+        tables.resolwe.url = str(server.make_url("/"))
+        tables.resolwe.auth = MagicMock(
+            token="secret-token", cookies={"sessionid": "s"}
+        )
+        tables._request_auth = lambda url: BaseTables._request_auth(tables, url)
+        tables._download_error = BaseTables._download_error
+
+        async with BaseTables._download_session() as session:
+            with self.assertRaises(aiohttp.ClientResponseError) as raised:
+                await BaseTables._fetch(
+                    tables, session, str(server.make_url("/data/1/file"))
+                )
+
+        self.assertEqual(raised.exception.status, 401)
+        self.assertNotIn("secret-token", repr(raised.exception))
+        self.assertNotIn("sessionid", repr(raised.exception))
+
+
 class TestMateFileGroups(unittest.TestCase):
     def test_paired_end(self):
         # The reads object merges lanes into one file per mate on its output.
@@ -523,3 +693,45 @@ class TestFragmentCounts(unittest.TestCase):
             fastq_names_per_mate=[["sampleB_L001", "sampleB_L002"]],
         )
         self.assertEqual(series["estimated_fragment_count_raw"], 10_000_000)
+
+
+class TestMacsPrepeakParser(unittest.TestCase):
+    def test_percentage_columns_become_fractions(self):
+        from resdk.tables.qc_mappings import MACS_PREPEAK_MAP
+
+        lines = [
+            "Sample\tTOTAL_READS\tMAPPED_PERCENTAGE\tNRF",
+            "sampleA\t1000\t95.5%\t0.9",
+            "Background of sampleA\t2000\t80%\t0.8",
+        ]
+        series = macs_prepeak_parser(
+            file_object=StringIO("\n".join(lines)),
+            name=123,
+            column_map=MACS_PREPEAK_MAP,
+            sample_name="sampleA",
+        )
+
+        self.assertEqual(series.name, 123)
+        self.assertAlmostEqual(series["case_prepeak_mapped_percentage"], 0.955)
+        self.assertAlmostEqual(series["control_prepeak_mapped_percentage"], 0.8)
+        self.assertEqual(series["case_prepeak_total_reads"], 1000)
+        self.assertEqual(series["control_prepeak_total_reads"], 2000)
+        self.assertAlmostEqual(series["control_prepeak_nrf"], 0.8)
+
+    def test_missing_percentage_cell_stays_missing(self):
+        from resdk.tables.qc_mappings import MACS_PREPEAK_MAP
+
+        lines = [
+            "Sample\tTOTAL_READS\tMAPPED_PERCENTAGE",
+            "sampleA\t1000\t95.5%",
+            "Background of sampleA\t2000\t",
+        ]
+        series = macs_prepeak_parser(
+            file_object=StringIO("\n".join(lines)),
+            name=123,
+            column_map=MACS_PREPEAK_MAP,
+            sample_name="sampleA",
+        )
+
+        self.assertAlmostEqual(series["case_prepeak_mapped_percentage"], 0.955)
+        self.assertTrue(pd.isna(series["control_prepeak_mapped_percentage"]))
